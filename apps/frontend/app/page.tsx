@@ -1,95 +1,16 @@
 "use client";
 
-import type { FormEvent, KeyboardEvent, ReactNode } from "react";
-import { useEffect, useRef, useState } from "react";
-
-const conversations = [
-  { title: "Launch narrative", meta: "Today", active: true },
-  { title: "Landing page polish", meta: "Today" },
-  { title: "Pricing objection map", meta: "Yesterday" },
-  { title: "Support inbox summary", meta: "Monday" },
-  { title: "Investor update draft", meta: "Apr 28" },
-  { title: "Voice and tone audit", meta: "Apr 24" },
-];
-
-const messages: Array<{
-  role: "assistant" | "user";
-  name: string;
-  meta: string;
-  body: ReactNode;
-}> = [
-  {
-    role: "user",
-    name: "You",
-    meta: "10:08",
-    body: (
-      <p>
-        Help me sharpen the product launch narrative. The audience is busy,
-        skeptical, and mostly wants to know why this matters now.
-      </p>
-    ),
-  },
-  {
-    role: "assistant",
-    name: "Chat app",
-    meta: "10:09",
-    body: (
-      <>
-        <p>
-          I would make the story quieter and more specific. Lead with the cost
-          of the current workflow, then show the product as the cleanest path
-          out of that friction.
-        </p>
-        <div className="grid gap-2 sm:grid-cols-3">
-          {["Current drag", "New behavior", "Measurable lift"].map((item) => (
-            <div
-              className="rounded-md border border-[#d9d8cf] bg-[#fbfaf5] p-3"
-              key={item}
-            >
-              <p className="text-xs font-medium uppercase text-[#73776e]">
-                Step
-              </p>
-              <p className="mt-1 text-sm font-semibold text-[#242620]">
-                {item}
-              </p>
-            </div>
-          ))}
-        </div>
-      </>
-    ),
-  },
-  {
-    role: "user",
-    name: "You",
-    meta: "10:13",
-    body: <p>Can you make it feel more executive-ready and less campaigny?</p>,
-  },
-  {
-    role: "assistant",
-    name: "Chat app",
-    meta: "10:14",
-    body: (
-      <>
-        <p>
-          Yes. Use less promise language and more operating language. The frame
-          becomes: teams are losing signal in scattered work, and this gives
-          leaders one reliable surface for decisions.
-        </p>
-        <blockquote className="border-l-2 border-[#2c7a58] pl-4 text-[#393c35]">
-          The launch is not about adding another workspace. It is about giving
-          teams a calmer way to turn fragmented conversations into decisions
-          that hold up under pressure.
-        </blockquote>
-      </>
-    ),
-  },
-];
-
-type LocalMessage = {
-  id: string;
-  text: string;
-  meta: string;
-};
+import type { FormEvent, KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createConversation as apiCreateConversation,
+  deleteConversation as apiDeleteConversation,
+  getConversation as apiGetConversation,
+  listConversations as apiListConversations,
+  streamAssistantReply,
+  type Conversation,
+  type Message,
+} from "./lib/chat-api";
 
 const icons = {
   archive: (
@@ -194,11 +115,21 @@ const icons = {
       <path d="m19 15 .7 2.1L22 18l-2.3.9L19 21l-.7-2.1L16 18l2.3-.9Z" />
     </>
   ),
+  stop: <rect x="7" y="7" width="10" height="10" rx="1.5" />,
   thumb: (
     <>
       <path d="M7 10v10" />
       <path d="M11 10V5a3 3 0 0 1 3 3v2h4a2 2 0 0 1 2 2l-1 6a2 2 0 0 1-2 2H7" />
       <path d="M3 10h4v10H3z" />
+    </>
+  ),
+  trash: (
+    <>
+      <path d="M3 6h18" />
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
     </>
   ),
 };
@@ -232,10 +163,12 @@ function IconButton({
   label,
   icon,
   className = "",
+  onClick,
 }: {
   label: string;
   icon: IconName;
   className?: string;
+  onClick?: () => void;
 }) {
   return (
     <button
@@ -243,62 +176,286 @@ function IconButton({
       className={`grid h-9 w-9 place-items-center rounded-md border border-[#dddcd2] bg-[#fbfaf5] text-[#555950] transition hover:border-[#c8c7bd] hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2c7a58] ${className}`}
       title={label}
       type="button"
+      onClick={onClick}
     >
       <Icon name={icon} />
     </button>
   );
 }
 
-function formatTime(date: Date) {
+function formatClock(date: Date) {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
 }
 
+function formatRelativeDay(timestamp: number) {
+  const now = Date.now();
+  const date = new Date(timestamp);
+  const today = new Date(now);
+  const startOfToday = new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate(),
+  ).getTime();
+  const dayMs = 24 * 60 * 60 * 1000;
+  if (timestamp >= startOfToday) return "Today";
+  if (timestamp >= startOfToday - dayMs) return "Yesterday";
+  if (timestamp >= startOfToday - 6 * dayMs) {
+    return new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(date);
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
+
+type StreamingState = {
+  conversationId: string;
+  draftAssistantContent: string;
+};
+
 export default function Home() {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<
+    string | null
+  >(null);
+  const [messagesByConversation, setMessagesByConversation] = useState<
+    Record<string, Message[]>
+  >({});
   const [draft, setDraft] = useState("");
-  const [localMessages, setLocalMessages] = useState<LocalMessage[]>([]);
+  const [streaming, setStreaming] = useState<StreamingState | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isHydrated, setIsHydrated] = useState(false);
+
   const threadEndRef = useRef<HTMLDivElement>(null);
-  const canSend = draft.trim().length > 0;
+  const abortRef = useRef<AbortController | null>(null);
+
+  const activeConversation = useMemo(
+    () =>
+      conversations.find((c) => c.id === activeConversationId) ?? null,
+    [conversations, activeConversationId],
+  );
+  const activeMessages = activeConversationId
+    ? (messagesByConversation[activeConversationId] ?? [])
+    : [];
+  const isStreamingActive =
+    streaming !== null && streaming.conversationId === activeConversationId;
+  const canSend =
+    draft.trim().length > 0 && !!activeConversationId && !isStreamingActive;
+
+  const refreshConversations = useCallback(async () => {
+    const list = await apiListConversations();
+    setConversations(list);
+    return list;
+  }, []);
+
+  const ensureMessagesLoaded = useCallback(
+    async (conversationId: string) => {
+      if (messagesByConversation[conversationId]) return;
+      const data = await apiGetConversation(conversationId);
+      setMessagesByConversation((prev) => ({
+        ...prev,
+        [conversationId]: data.messages,
+      }));
+    },
+    [messagesByConversation],
+  );
 
   useEffect(() => {
-    if (localMessages.length === 0) {
-      return;
-    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await refreshConversations();
+        if (cancelled) return;
+        if (list.length === 0) {
+          const created = await apiCreateConversation();
+          if (cancelled) return;
+          setConversations([created]);
+          setActiveConversationId(created.id);
+          setMessagesByConversation((prev) => ({ ...prev, [created.id]: [] }));
+        } else {
+          setActiveConversationId(list[0]!.id);
+          await ensureMessagesLoaded(list[0]!.id);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setErrorMessage(
+            err instanceof Error ? err.message : "Failed to load chats",
+          );
+        }
+      } finally {
+        if (!cancelled) setIsHydrated(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshConversations, ensureMessagesLoaded]);
 
+  useEffect(() => {
     threadEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
-  }, [localMessages]);
+  }, [activeMessages.length, streaming?.draftAssistantContent]);
 
-  function submitMessage() {
-    const text = draft.trim();
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
 
-    if (!text) {
-      return;
+  const handleSelectConversation = useCallback(
+    async (id: string) => {
+      if (id === activeConversationId) return;
+      setActiveConversationId(id);
+      try {
+        await ensureMessagesLoaded(id);
+      } catch (err) {
+        setErrorMessage(
+          err instanceof Error ? err.message : "Failed to load conversation",
+        );
+      }
+    },
+    [activeConversationId, ensureMessagesLoaded],
+  );
+
+  const handleNewChat = useCallback(async () => {
+    if (streaming) return;
+    try {
+      const created = await apiCreateConversation();
+      setConversations((prev) => [created, ...prev]);
+      setMessagesByConversation((prev) => ({ ...prev, [created.id]: [] }));
+      setActiveConversationId(created.id);
+      setDraft("");
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error ? err.message : "Failed to create chat",
+      );
     }
+  }, [streaming]);
 
-    setLocalMessages((currentMessages) => [
-      ...currentMessages,
-      {
-        id: `${Date.now()}-${currentMessages.length}`,
-        text,
-        meta: formatTime(new Date()),
-      },
-    ]);
+  const handleDeleteConversation = useCallback(
+    async (id: string, event: React.MouseEvent) => {
+      event.stopPropagation();
+      if (streaming?.conversationId === id) {
+        abortRef.current?.abort();
+      }
+      try {
+        await apiDeleteConversation(id);
+      } catch (err) {
+        setErrorMessage(
+          err instanceof Error ? err.message : "Failed to delete chat",
+        );
+        return;
+      }
+      setMessagesByConversation((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setConversations((prev) => {
+        const next = prev.filter((c) => c.id !== id);
+        if (id === activeConversationId) {
+          setActiveConversationId(next[0]?.id ?? null);
+        }
+        return next;
+      });
+    },
+    [activeConversationId, streaming],
+  );
+
+  const handleStop = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  const submitMessage = useCallback(async () => {
+    const text = draft.trim();
+    if (!text || !activeConversationId || streaming) return;
+
+    const conversationId = activeConversationId;
     setDraft("");
-  }
+    setErrorMessage(null);
 
-  function handleComposerSubmit(event: FormEvent<HTMLFormElement>) {
+    const optimisticUserMessage: Message = {
+      id: `local-user-${Date.now()}`,
+      conversationId,
+      role: "user",
+      content: text,
+      createdAt: Date.now(),
+    };
+    setMessagesByConversation((prev) => ({
+      ...prev,
+      [conversationId]: [
+        ...(prev[conversationId] ?? []),
+        optimisticUserMessage,
+      ],
+    }));
+
+    setStreaming({ conversationId, draftAssistantContent: "" });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      await streamAssistantReply(conversationId, text, {
+        signal: controller.signal,
+        onDelta: (chunk) => {
+          setStreaming((prev) =>
+            prev && prev.conversationId === conversationId
+              ? {
+                  ...prev,
+                  draftAssistantContent: prev.draftAssistantContent + chunk,
+                }
+              : prev,
+          );
+        },
+      });
+    } catch (err) {
+      const aborted =
+        controller.signal.aborted ||
+        (err instanceof DOMException && err.name === "AbortError");
+      if (!aborted) {
+        setErrorMessage(
+          err instanceof Error ? err.message : "Streaming failed",
+        );
+      }
+    } finally {
+      try {
+        const fresh = await apiGetConversation(conversationId);
+        setMessagesByConversation((prev) => ({
+          ...prev,
+          [conversationId]: fresh.messages,
+        }));
+        setConversations((prev) => {
+          const others = prev.filter((c) => c.id !== conversationId);
+          return [fresh.conversation, ...others];
+        });
+      } catch {}
+      setStreaming(null);
+      if (abortRef.current === controller) abortRef.current = null;
+    }
+  }, [activeConversationId, draft, streaming]);
+
+  const handleComposerSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    submitMessage();
-  }
+    void submitMessage();
+  };
 
-  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+  const handleComposerKeyDown = (
+    event: KeyboardEvent<HTMLTextAreaElement>,
+  ) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      submitMessage();
+      void submitMessage();
     }
-  }
+  };
+
+  const showEmptyThread =
+    isHydrated &&
+    !!activeConversationId &&
+    activeMessages.length === 0 &&
+    !isStreamingActive;
 
   return (
     <main className="h-[100svh] overflow-hidden bg-[#f6f5ef] text-[#20221f]">
@@ -316,8 +473,10 @@ export default function Home() {
 
           <div className="space-y-2 p-3">
             <button
-              className="flex h-10 w-full items-center gap-2 rounded-md bg-[#f1f0e8] px-3 text-sm font-semibold text-[#181b16] transition hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d9f2cf]"
+              className="flex h-10 w-full items-center gap-2 rounded-md bg-[#f1f0e8] px-3 text-sm font-semibold text-[#181b16] transition hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d9f2cf] disabled:cursor-not-allowed disabled:opacity-60"
               type="button"
+              onClick={() => void handleNewChat()}
+              disabled={streaming !== null}
             >
               <Icon name="plus" />
               New chat
@@ -346,33 +505,59 @@ export default function Home() {
             <p className="px-3 pb-2 pt-3 text-xs font-medium text-[#858b80]">
               Recent
             </p>
-            {conversations.map((conversation) => (
-              <button
-                className={`flex w-full items-start justify-between gap-3 rounded-md px-3 py-2 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d9f2cf] ${
-                  conversation.active
-                    ? "bg-[#f1f0e8] text-[#181b16]"
-                    : "text-[#d6d8d0] hover:bg-white/10 hover:text-white"
-                }`}
-                key={conversation.title}
-                type="button"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium">
-                    {conversation.title}
-                  </span>
-                  <span
-                    className={`mt-0.5 block text-xs ${
-                      conversation.active ? "text-[#5f6559]" : "text-[#878d82]"
+            {conversations.length === 0 ? (
+              <p className="px-3 py-4 text-xs text-[#858b80]">
+                {isHydrated ? "No conversations yet." : "Loading…"}
+              </p>
+            ) : null}
+            {conversations.map((conversation) => {
+              const isActive = conversation.id === activeConversationId;
+              return (
+                <div
+                  key={conversation.id}
+                  className={`group relative flex w-full items-start gap-2 rounded-md transition ${
+                    isActive
+                      ? "bg-[#f1f0e8] text-[#181b16]"
+                      : "text-[#d6d8d0] hover:bg-white/10 hover:text-white"
+                  }`}
+                >
+                  <button
+                    className="flex min-w-0 flex-1 items-start justify-between gap-3 rounded-md px-3 py-2 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d9f2cf]"
+                    onClick={() => void handleSelectConversation(conversation.id)}
+                    type="button"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium">
+                        {conversation.title}
+                      </span>
+                      <span
+                        className={`mt-0.5 block text-xs ${
+                          isActive ? "text-[#5f6559]" : "text-[#878d82]"
+                        }`}
+                      >
+                        {formatRelativeDay(conversation.updatedAt)}
+                      </span>
+                    </span>
+                    {isActive ? (
+                      <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-[#2c7a58]" />
+                    ) : null}
+                  </button>
+                  <button
+                    aria-label="Delete chat"
+                    title="Delete chat"
+                    type="button"
+                    onClick={(event) =>
+                      void handleDeleteConversation(conversation.id, event)
+                    }
+                    className={`mr-1 mt-1.5 grid h-7 w-7 shrink-0 place-items-center rounded-md text-current transition opacity-0 group-hover:opacity-100 hover:bg-black/10 focus-visible:opacity-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#d9f2cf] ${
+                      isActive ? "text-[#5f6559]" : "text-[#a7aca2]"
                     }`}
                   >
-                    {conversation.meta}
-                  </span>
-                </span>
-                {conversation.active ? (
-                  <span className="mt-1 h-2 w-2 rounded-full bg-[#2c7a58]" />
-                ) : null}
-              </button>
-            ))}
+                    <Icon name="trash" className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              );
+            })}
           </nav>
 
           <div className="border-t border-white/10 p-3">
@@ -409,10 +594,10 @@ export default function Home() {
               </button>
               <div className="min-w-0 px-1">
                 <p className="truncate text-sm font-semibold text-[#242620]">
-                  Launch narrative
+                  {activeConversation?.title ?? "Chat App"}
                 </p>
                 <p className="hidden text-xs text-[#74786f] sm:block">
-                  Private thread
+                  {isStreamingActive ? "Streaming response…" : "Private thread"}
                 </p>
               </div>
             </div>
@@ -440,129 +625,48 @@ export default function Home() {
           <section className="min-h-0 flex-1 overflow-hidden">
             <div className="mx-auto flex h-full min-h-0 max-w-5xl flex-col px-4 md:px-8">
               <div className="min-h-0 flex-1 overflow-y-auto py-6 md:py-8">
-                <div className="mb-7 flex flex-col gap-4 border-b border-[#e2e0d7] pb-6 md:flex-row md:items-end md:justify-between">
-                  <div>
-                    <div className="mb-3 flex items-center gap-2 text-sm text-[#6f746b]">
-                      <span className="grid h-7 w-7 place-items-center rounded-md bg-[#d9f2cf] text-[#17391e]">
-                        <Icon name="spark" className="h-4 w-4" />
-                      </span>
-                      <span>Active conversation</span>
-                    </div>
-                    <h1 className="text-2xl font-semibold leading-8 text-[#1d201b] md:text-3xl md:leading-10">
-                      Shape the launch story into a clear executive narrative.
-                    </h1>
+                {errorMessage ? (
+                  <div
+                    role="alert"
+                    className="mb-4 flex items-start justify-between gap-3 rounded-md border border-[#e6c2bd] bg-[#fbeae6] px-4 py-3 text-sm text-[#7a2c1f]"
+                  >
+                    <span>{errorMessage}</span>
+                    <button
+                      type="button"
+                      className="text-xs font-semibold uppercase tracking-wide text-[#7a2c1f] hover:underline"
+                      onClick={() => setErrorMessage(null)}
+                    >
+                      Dismiss
+                    </button>
                   </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {["Focused", "Private", "Draft"].map((item) => (
-                      <span
-                        className="rounded-md border border-[#dddcd2] bg-[#fbfaf5] px-3 py-1.5 text-xs font-medium text-[#555950]"
-                        key={item}
-                      >
-                        {item}
-                      </span>
-                    ))}
-                  </div>
-                </div>
+                ) : null}
 
                 <div className="space-y-6">
-                  {messages.map((message, index) => (
-                    <article
-                      className={`flex gap-3 ${
-                        message.role === "user" ? "justify-end" : ""
-                      }`}
-                      key={`${message.name}-${index}`}
-                    >
-                      {message.role === "assistant" ? (
-                        <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#d9f2cf] text-sm font-bold text-[#17391e]">
-                          C
-                        </div>
-                      ) : null}
-
-                      <div
-                        className={`max-w-[min(720px,100%)] ${
-                          message.role === "user"
-                            ? "rounded-lg bg-[#20251f] px-4 py-3 text-white shadow-sm"
-                            : "text-[#2d302a]"
-                        }`}
-                      >
-                        <div
-                          className={`mb-2 flex items-center gap-2 text-xs ${
-                            message.role === "user"
-                              ? "text-[#cfd6cc]"
-                              : "text-[#777c72]"
-                          }`}
-                        >
-                          <span className="font-semibold">{message.name}</span>
-                          <span>{message.meta}</span>
-                        </div>
-                        <div className="space-y-4 text-[15px] leading-7">
-                          {message.body}
-                        </div>
-
-                        {message.role === "assistant" ? (
-                          <div className="mt-3 flex items-center gap-1.5 text-[#777c72]">
-                            {[
-                              { icon: "copy" as const, label: "Copy" },
-                              { icon: "rotate" as const, label: "Regenerate" },
-                              { icon: "thumb" as const, label: "Good response" },
-                              { icon: "more" as const, label: "More" },
-                            ].map((action) => (
-                              <button
-                                aria-label={action.label}
-                                className="grid h-8 w-8 place-items-center rounded-md transition hover:bg-[#eeece3] hover:text-[#242620] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2c7a58]"
-                                key={action.label}
-                                title={action.label}
-                                type="button"
-                              >
-                                <Icon name={action.icon} className="h-3.5 w-3.5" />
-                              </button>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-
-                      {message.role === "user" ? (
-                        <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#f8c77e] text-sm font-bold text-[#3e2507]">
-                          J
-                        </div>
-                      ) : null}
-                    </article>
-                  ))}
-
-                  {localMessages.map((message) => (
-                    <article className="flex justify-end gap-3" key={message.id}>
-                      <div className="max-w-[min(720px,100%)] rounded-lg bg-[#20251f] px-4 py-3 text-white shadow-sm">
-                        <div className="mb-2 flex items-center gap-2 text-xs text-[#cfd6cc]">
-                          <span className="font-semibold">You</span>
-                          <span>{message.meta}</span>
-                        </div>
-                        <p className="whitespace-pre-wrap text-[15px] leading-7">
-                          {message.text}
+                  {showEmptyThread ? (
+                    <div className="flex flex-col items-center justify-center gap-3 py-20 text-center text-[#74786f]">
+                      <span className="grid h-12 w-12 place-items-center rounded-md bg-[#d9f2cf] text-[#17391e]">
+                        <Icon name="spark" className="h-5 w-5" />
+                      </span>
+                      <div>
+                        <p className="text-base font-semibold text-[#242620]">
+                          Start a new conversation
+                        </p>
+                        <p className="text-sm">
+                          Type your first message below and the response will
+                          stream in.
                         </p>
                       </div>
-                      <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#f8c77e] text-sm font-bold text-[#3e2507]">
-                        J
-                      </div>
-                    </article>
+                    </div>
+                  ) : null}
+
+                  {activeMessages.map((message) => (
+                    <MessageRow key={message.id} message={message} />
                   ))}
 
-                  {localMessages.length === 0 ? (
-                    <article className="flex gap-3">
-                      <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#d9f2cf] text-sm font-bold text-[#17391e]">
-                        C
-                      </div>
-                      <div>
-                        <div className="mb-2 flex items-center gap-2 text-xs text-[#777c72]">
-                          <span className="font-semibold">Chat app</span>
-                          <span>typing</span>
-                        </div>
-                        <div className="flex h-10 items-center gap-1 rounded-lg border border-[#dddcd2] bg-[#fbfaf5] px-4">
-                          <span className="h-2 w-2 rounded-full bg-[#2c7a58]" />
-                          <span className="h-2 w-2 rounded-full bg-[#8ab69b]" />
-                          <span className="h-2 w-2 rounded-full bg-[#c7d8c5]" />
-                        </div>
-                      </div>
-                    </article>
+                  {isStreamingActive ? (
+                    <StreamingAssistantRow
+                      content={streaming!.draftAssistantContent}
+                    />
                   ) : null}
 
                   <div ref={threadEndRef} />
@@ -576,11 +680,16 @@ export default function Home() {
                 >
                   <textarea
                     aria-label="Message"
-                    className="min-h-24 w-full resize-none bg-transparent px-4 py-4 text-[15px] leading-6 text-[#242620] outline-none placeholder:text-[#8a8e84]"
+                    className="min-h-24 w-full resize-none bg-transparent px-4 py-4 text-[15px] leading-6 text-[#242620] outline-none placeholder:text-[#8a8e84] disabled:opacity-60"
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
-                    placeholder="Ask anything"
+                    placeholder={
+                      isStreamingActive
+                        ? "Streaming response…"
+                        : "Ask anything"
+                    }
                     value={draft}
+                    disabled={isStreamingActive || !activeConversationId}
                   />
                   <div className="flex items-center justify-between gap-3 border-t border-[#e6e4dc] px-3 py-3">
                     <div className="flex min-w-0 items-center gap-1.5">
@@ -608,19 +717,31 @@ export default function Home() {
                       </button>
                     </div>
 
-                    <button
-                      aria-label="Send message"
-                      className={`grid h-10 w-10 place-items-center rounded-md text-white shadow-sm transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2c7a58] ${
-                        canSend
-                          ? "bg-[#1f251f] hover:bg-[#2d352d]"
-                          : "cursor-not-allowed bg-[#9ea49b]"
-                      }`}
-                      disabled={!canSend}
-                      title="Send message"
-                      type="submit"
-                    >
-                      <Icon name="arrowUp" className="h-5 w-5" />
-                    </button>
+                    {isStreamingActive ? (
+                      <button
+                        aria-label="Stop generating"
+                        title="Stop generating"
+                        type="button"
+                        onClick={handleStop}
+                        className="grid h-10 w-10 place-items-center rounded-md bg-[#1f251f] text-white shadow-sm transition hover:bg-[#2d352d] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2c7a58]"
+                      >
+                        <Icon name="stop" className="h-4 w-4" />
+                      </button>
+                    ) : (
+                      <button
+                        aria-label="Send message"
+                        className={`grid h-10 w-10 place-items-center rounded-md text-white shadow-sm transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2c7a58] ${
+                          canSend
+                            ? "bg-[#1f251f] hover:bg-[#2d352d]"
+                            : "cursor-not-allowed bg-[#9ea49b]"
+                        }`}
+                        disabled={!canSend}
+                        title="Send message"
+                        type="submit"
+                      >
+                        <Icon name="arrowUp" className="h-5 w-5" />
+                      </button>
+                    )}
                   </div>
                 </form>
               </footer>
@@ -629,5 +750,81 @@ export default function Home() {
         </div>
       </div>
     </main>
+  );
+}
+
+function MessageRow({ message }: { message: Message }) {
+  const isUser = message.role === "user";
+  const meta = formatClock(new Date(message.createdAt));
+  return (
+    <article className={`flex gap-3 ${isUser ? "justify-end" : ""}`}>
+      {!isUser ? (
+        <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#d9f2cf] text-sm font-bold text-[#17391e]">
+          C
+        </div>
+      ) : null}
+
+      <div
+        className={`max-w-[min(720px,100%)] ${
+          isUser
+            ? "rounded-lg bg-[#20251f] px-4 py-3 text-white shadow-sm"
+            : "text-[#2d302a]"
+        }`}
+      >
+        <div
+          className={`mb-2 flex items-center gap-2 text-xs ${
+            isUser ? "text-[#cfd6cc]" : "text-[#777c72]"
+          }`}
+        >
+          <span className="font-semibold">{isUser ? "You" : "Chat app"}</span>
+          <span>{meta}</span>
+        </div>
+        <p className="whitespace-pre-wrap text-[15px] leading-7">
+          {message.content}
+        </p>
+      </div>
+
+      {isUser ? (
+        <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#f8c77e] text-sm font-bold text-[#3e2507]">
+          J
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function StreamingAssistantRow({ content }: { content: string }) {
+  const hasContent = content.length > 0;
+  return (
+    <article className="flex gap-3" aria-live="polite" aria-busy="true">
+      <div className="mt-1 grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#d9f2cf] text-sm font-bold text-[#17391e]">
+        C
+      </div>
+      <div className="max-w-[min(720px,100%)] text-[#2d302a]">
+        <div className="mb-2 flex items-center gap-2 text-xs text-[#777c72]">
+          <span className="font-semibold">Chat app</span>
+          <span>typing…</span>
+        </div>
+        {hasContent ? (
+          <p className="whitespace-pre-wrap text-[15px] leading-7">
+            {content}
+            <span
+              aria-hidden="true"
+              className="ml-0.5 inline-block h-[1em] w-[2px] translate-y-[2px] animate-pulse bg-[#2c7a58] align-middle"
+            />
+          </p>
+        ) : (
+          <div
+            role="status"
+            aria-label="Assistant is preparing a reply"
+            className="flex h-10 items-center gap-1 rounded-lg border border-[#dddcd2] bg-[#fbfaf5] px-4"
+          >
+            <span className="h-2 w-2 animate-typing-dot rounded-full bg-[#2c7a58] [animation-delay:0ms]" />
+            <span className="h-2 w-2 animate-typing-dot rounded-full bg-[#2c7a58] [animation-delay:150ms]" />
+            <span className="h-2 w-2 animate-typing-dot rounded-full bg-[#2c7a58] [animation-delay:300ms]" />
+          </div>
+        )}
+      </div>
+    </article>
   );
 }
